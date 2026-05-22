@@ -74,6 +74,29 @@ class WarmupCallback(pl.Callback):
         self.state.update(state_dict)
 
 
+class FirstCheckpointCallback(pl.Callback):
+
+    def __init__(self, filename: str = "last.ckpt") -> None:
+        super().__init__()
+        self.filename = filename
+        self.state = {"saved": False}
+
+    def on_train_start(self, trainer, pl_module) -> None:
+        if self.state["saved"]:
+            return
+
+        checkpoint_path = os.path.join(trainer.log_dir, "checkpoints")
+        os.makedirs(checkpoint_path, exist_ok=True)
+        trainer.save_checkpoint(os.path.join(checkpoint_path, self.filename))
+        self.state["saved"] = True
+
+    def state_dict(self):
+        return self.state.copy()
+
+    def load_state_dict(self, state_dict):
+        self.state.update(state_dict)
+
+
 class QuantizeCallback(WarmupCallback):
 
     def on_train_batch_(self, trainer, pl_module, batch,
@@ -163,7 +186,7 @@ class RAVE(pl.LightningModule):
         feature_matching_fun,
         num_skipped_features,
         audio_distance: Callable[[], nn.Module],
-        multiband_audio_distance: Callable[[], nn.Module],
+        multiband_audio_distance: Optional[Callable[[], nn.Module]],
         n_bands: int = 16,
         balancer = None,
         weights: Optional[Dict[str, float]] = None,
@@ -181,15 +204,17 @@ class RAVE(pl.LightningModule):
         is_mel_input: Optional[bool] = None,
         no_freeze_when_warmed_up: bool = False, 
         loss_weights = None,
-        update_pca=True
+        update_pca=True,
+        gradient_clip_gen: Optional[float] = None,
+        gradient_clip_dis: Optional[float] = None,
     ):
         super().__init__()
-        self.pqmf = pqmf(n_channels=n_channels)
+        self.pqmf = pqmf(n_channels=n_channels) if pqmf is not None else None
         self.spectrogram = None
         if spectrogram is not None:
             self.spectrogram = spectrogram
-        assert input_mode in ['pqmf', 'mel', 'raw']
-        assert output_mode in ['raw', 'pqmf']
+        assert input_mode in ['pqmf', 'mel', 'raw', 'complex_stft']
+        assert output_mode in ['raw', 'pqmf', 'complex_stft']
         self.input_mode = input_mode
         self.output_mode = output_mode
         # retro-compatibility
@@ -207,9 +232,11 @@ class RAVE(pl.LightningModule):
         self.no_freeze_when_warmed_up = no_freeze_when_warmed_up
         self.decoder = decoder(n_channels=n_channels)
         self.discriminator = discriminator(n_channels=n_channels)
+        self.gradient_clip_gen = gradient_clip_gen
+        self.gradient_clip_dis = gradient_clip_dis
 
         self.audio_distance = audio_distance()
-        self.multiband_audio_distance = multiband_audio_distance()
+        self.multiband_audio_distance = multiband_audio_distance() if multiband_audio_distance is not None else None
 
         self.gan_loss = gan_loss
 
@@ -247,22 +274,65 @@ class RAVE(pl.LightningModule):
         self.audio_monitor_epochs = audio_monitor_epochs
 
     @gin.configurable(module="rave")
-    def configure_optimizers(self, weight_list = None, lr_gen=1.e-3, lr_dis = 1.e-4):
+    def configure_optimizers(self, weight_list = None, lr_gen=1.e-4, lr_dis = 1.e-4):
+        def log_optimizer_params(prefix, gen_named_p, dis_named_p):
+            gen_count = sum(p.numel() for _, p in gen_named_p)
+            dis_count = sum(p.numel() for _, p in dis_named_p)
+            logging.info(
+                "%s optimizer parameters: generator=%d tensors / %d scalars, "
+                "discriminator=%d tensors / %d scalars",
+                prefix,
+                len(gen_named_p),
+                gen_count,
+                len(dis_named_p),
+                dis_count,
+            )
+            logging.info(
+                "%s generator parameter names:\n%s",
+                prefix,
+                "\n".join(
+                    f"  {name}: shape={tuple(param.shape)}, numel={param.numel()}"
+                    for name, param in gen_named_p),
+            )
+            logging.info(
+                "%s discriminator parameter names:\n%s",
+                prefix,
+                "\n".join(
+                    f"  {name}: shape={tuple(param.shape)}, numel={param.numel()}"
+                    for name, param in dis_named_p),
+            )
+
         if weight_list is None:
-            gen_p = list(self.encoder.parameters())
-            gen_p += list(self.decoder.parameters())
-            dis_p = list(self.discriminator.parameters())
-            gen_opt = torch.optim.Adam(gen_p, lr_gen, (.5, .9))
-            dis_opt = torch.optim.Adam(dis_p, lr_dis, (.5, .9))
+            gen_named_p = [(f"encoder.{name}", param)
+                           for name, param in self.encoder.named_parameters()]
+            gen_named_p += [(f"decoder.{name}", param)
+                            for name, param in self.decoder.named_parameters()]
+            dis_named_p = [(f"discriminator.{name}", param)
+                           for name, param in self.discriminator.named_parameters()]
+            log_optimizer_params("full", gen_named_p, dis_named_p)
+            gen_p = [param for _, param in gen_named_p]
+            dis_p = [param for _, param in dis_named_p]
+            gen_opt = torch.optim.AdamW(gen_p, lr_gen, (.9, .999))
+            dis_opt = torch.optim.AdamW(dis_p, lr_dis, (.8, .9))
             return ({'optimizer': gen_opt,
-                    'lr_scheduler': {'scheduler': torch.optim.lr_scheduler.LinearLR(gen_opt, start_factor=1.0, end_factor=0.1, total_iters=self.warmup)}},
+                    'lr_scheduler': {'scheduler': torch.optim.lr_scheduler.LinearLR(gen_opt, start_factor=1.0, end_factor=1., total_iters=self.warmup)}},
                     {'optimizer':dis_opt})
 
         else: 
             params = dict(self.named_parameters())
             weight_names = list(filter(lambda x: x in params, weight_list))
-            gen_p = list(map(lambda x: self.get_parameter(x), filter(lambda x: not x.startswith('discriminator'), weight_names)))
-            dis_p = list(map(lambda x: self.get_parameter(x), filter(lambda x: x.startswith('discriminator'), weight_names)))
+            gen_names = list(filter(lambda x: not x.startswith('discriminator'), weight_names))
+            dis_names = list(filter(lambda x: x.startswith('discriminator'), weight_names))
+            gen_named_p = [(name, self.get_parameter(name)) for name in gen_names]
+            dis_named_p = [(name, self.get_parameter(name)) for name in dis_names]
+            gen_p = [param for _, param in gen_named_p]
+            dis_p = [param for _, param in dis_named_p]
+            logging.info(
+                "partial optimizer parameter names: requested=%d, matched=%d",
+                len(weight_list),
+                len(weight_names),
+            )
+            log_optimizer_params("partial", gen_named_p, dis_named_p)
             optimizers = []
             #TODO not efficient but would require too much re-factor
             if len(gen_p) > 0: 
@@ -306,8 +376,7 @@ class RAVE(pl.LightningModule):
                     self.get_buffer(k).data = v
                 except Exception as e:
                     raise e
-                    
-        
+                
 
     def _mel_encode(self, x: torch.Tensor):
         batch_size = x.shape[:-2]
@@ -321,13 +390,18 @@ class RAVE(pl.LightningModule):
             x_enc = _pqmf_encode(self.pqmf, x_enc)
         elif self.input_mode == "mel":
             x_enc = self._mel_encode(x)
+        elif self.input_mode == "complex_stft":
+            x_enc = self.spectrogram(x)
             
         z = self.encoder(x_enc)
         if return_mb:
             if self.input_mode == "pqmf":
                 return z, x_enc
             else:
-                x_multiband = _pqmf_encode(self.pqmf, x)
+                if self.multiband_audio_distance is not None:
+                    x_multiband = _pqmf_encode(self.pqmf, x)
+                else:
+                    x_multiband = None
                 return z, x_multiband
         return z
 
@@ -378,6 +452,8 @@ class RAVE(pl.LightningModule):
         y = self.decoder(z)
         if self.output_mode == "pqmf":
             y = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
+        elif self.output_mode == "complex_stft":
+            y = self.spectrogram.inverse(y)
         return y
 
     def forward(self, x):
@@ -423,14 +499,19 @@ class RAVE(pl.LightningModule):
         if self.output_mode == "pqmf":
             y_multiband = y
             y_raw = _pqmf_decode(self.pqmf, y, batch_size=batch_size, n_channels=self.n_channels)
+        elif self.output_mode== "complex_stft":
+            y_multiband = None
+            y_raw = self.spectrogram.inverse(y)
         else:
             y_raw = y 
             y_multiband = _pqmf_encode(self.pqmf, y)
 
         # TODO this has been added for training with num_samples = 65536 samples, output padding seems to mess with output dimensions. 
         # this may probably conflict with cached_conv
+        
         y_raw = y_raw[..., :x_raw.shape[-1]]
-        y_multiband = y_multiband[..., :x_multiband.shape[-1]]
+        if y_multiband is not None:
+            y_multiband = y_multiband[..., :x_multiband.shape[-1]]
 
         p.tick('decode')
 
@@ -447,11 +528,13 @@ class RAVE(pl.LightningModule):
 
         # DISTANCE BETWEEN INPUT AND OUTPUT
         distances = {}
-        multiband_distance =  self.multiband_audio_distance(
-            x_multiband, y_multiband)
-        p.tick('mb distance')
-        for k, v in multiband_distance.items():
-            distances[f'multiband_{k}'] = self.loss_weight('multiband_audio_distance', batch_idx) * v
+        
+        if self.multiband_audio_distance is not None:
+            multiband_distance =  self.multiband_audio_distance(
+                x_multiband, y_multiband)
+            p.tick('mb distance')
+            for k, v in multiband_distance.items():
+                distances[f'multiband_{k}'] = self.loss_weight('multiband_audio_distance', batch_idx) * v
 
         fullband_distance = self.audio_distance(x_raw, y_raw)
         p.tick('fb distance')
@@ -477,8 +560,8 @@ class RAVE(pl.LightningModule):
                 current_feature_distance = sum(
                     map(
                         self.feature_matching_fun,
-                        scale_real[self.num_skipped_features:],
-                        scale_fake[self.num_skipped_features:],
+                        scale_real[self.num_skipped_features:-1],
+                        scale_fake[self.num_skipped_features:-1],
                     )) / len(scale_real[self.num_skipped_features:])
 
                 feature_matching_distance = feature_matching_distance + current_feature_distance
@@ -493,6 +576,8 @@ class RAVE(pl.LightningModule):
 
             feature_matching_distance = feature_matching_distance / len(
                 feature_real)
+            loss_adv = loss_adv / len(feature_real)
+            loss_dis = 2. * loss_dis / len(feature_real)
 
         else:
             pred_real = torch.tensor(0.).to(x_raw)
@@ -510,23 +595,35 @@ class RAVE(pl.LightningModule):
             loss_gen['regularization'] = reg * self.beta_factor
 
         if self.warmed_up:
-            loss_gen['feature_matching'] = self.loss_weight('feature_matching', batch_idx) * feature_matching_distance
-            loss_gen['adversarial'] = self.loss_weight('adversarial', batch_idx) * loss_adv
+            loss_gen['feature_matching'] = feature_matching_distance #REMOVE DOUBLE WEIGHTING * self.loss_weight('feature_matching', batch_idx) * 
+            loss_gen['adversarial'] = loss_adv  #REMOVE DOUBLE WEIGHTING self.loss_weight('adversarial', batch_idx) * 
 
         # OPTIMIZATION
         if not (batch_idx %
                 self.update_discriminator_every) and self.warmed_up:
             dis_opt.zero_grad()
             loss_dis.backward()
+            if self.gradient_clip_dis is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    self.discriminator.parameters(),
+                    self.gradient_clip_dis,
+                )
             dis_opt.step()
             p.tick('dis opt')
         else:
             gen_opt.zero_grad()
             loss_gen_value = 0.
             for k, v in loss_gen.items():
+                # print("loss", k, "weight", self.loss_weight(k, batch_idx) if k in self.weights else "not defined")
                 weight = 1. if not k in self.weights else self.loss_weight(k, batch_idx)
                 loss_gen_value += v * weight
             loss_gen_value.backward()
+            if self.gradient_clip_gen is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) +
+                    list(self.decoder.parameters()),
+                    self.gradient_clip_gen,
+                )
             gen_opt.step()
 
         # LOGGING
@@ -591,7 +688,7 @@ class RAVE(pl.LightningModule):
         if self.trainer.state.stage == RunningStage.SANITY_CHECKING:
             return
 
-        z = torch.stack(self.latent_val_buffer, 0)
+        z = torch.stack(self.latent_val_buffer, 0) 
         audio = torch.cat(self.audio_val_buffer, 0)
         if isinstance(self.encoder, blocks.VariationalEncoder):
             if not (self.warmed_up and not self.no_freeze_when_warmed_up) and (self.update_pca):
@@ -625,6 +722,8 @@ class RAVE(pl.LightningModule):
         self.logger.experiment.add_audio("audio_val", y, self.eval_number,
                                         self.sr)
         self.eval_number += 1
+        self.audio_val_buffer = []
+        self.latent_val_buffer = []
 
     def on_fit_start(self):
         tb = self.logger.experiment
@@ -640,4 +739,3 @@ class RAVE(pl.LightningModule):
         model = ['```'] + model + ['```']
         model = '\n'.join(model)
         tb.add_text("model", model)
-

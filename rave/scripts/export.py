@@ -21,6 +21,7 @@ import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from absl import flags, app
+
 from typing import Union, Optional, Tuple
 
 try:
@@ -31,6 +32,7 @@ except:
     import rave
 import rave.blocks
 import rave.core
+from rave.stft import CausalSTFT, StreamableSTFT
 import rave.resampler
 from rave.prior import model as prior
 
@@ -43,6 +45,9 @@ flags.DEFINE_string('run',
 flags.DEFINE_bool('streaming',
                   default=False,
                   help='Enable the model streaming mode')
+flags.DEFINE_bool('use_causal_stft',
+                  default=True,
+                  help='Replace StreamableSTFT with CausalSTFT during streaming export')
 flags.DEFINE_float(
     'fidelity',
     default=.95,
@@ -80,6 +85,13 @@ flags.DEFINE_string('prior',
                     help = "path to prior (optional)")
 
 
+
+class DumbPQMF(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x
+    def inverse(self, x: torch.Tensor):
+        return x
+    
 class DumbPrior(nn.Module):
     def forward(self, x: torch.Tensor):
         return x
@@ -95,7 +107,7 @@ class ScriptedRAVE(nn_tilde.Module):
                  latent_size: int = None) -> None:
 
         super().__init__()
-        self.pqmf = pretrained.pqmf
+        self.pqmf = pretrained.pqmf if pretrained.pqmf is not None else DumbPQMF()
         self.sr = pretrained.sr
         self.spectrogram = pretrained.spectrogram
         self.resampler = None
@@ -140,6 +152,7 @@ class ScriptedRAVE(nn_tilde.Module):
                     latent_size = max(
                         np.argmax(pretrained.fidelity.numpy() > fidelity), 1)
                     latent_size = 2**math.ceil(math.log2(latent_size))
+                    print("Latent size from PCA : ", latent_size)
 
             elif isinstance(pretrained.encoder, rave.blocks.DiscreteEncoder):
                 latent_size = pretrained.encoder.num_quantizers
@@ -281,6 +294,8 @@ class ScriptedRAVE(nn_tilde.Module):
             x = x.reshape(-1, 1, x.shape[-1])
             x = self.pqmf(x)
             x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode =="complex_stft":
+            x = self.spectrogram(x)
         elif self.input_mode == "mel":
             if self.spectrogram is not None:
                 x = self.spectrogram(x)[..., :-1]
@@ -311,6 +326,8 @@ class ScriptedRAVE(nn_tilde.Module):
             y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
             y = self.pqmf.inverse(y)
             y = y.reshape(batch_size+(self.n_channels, -1))
+        elif self.output_mode=="complex_stft":
+            y = self.spectrogram.inverse(y)
 
         if self.resampler is not None:
             y = self.resampler.from_model_sampling_rate(y)
@@ -340,6 +357,8 @@ class ScriptedRAVE(nn_tilde.Module):
             y = y.reshape(y.shape[0] * self.n_channels, -1, y.shape[-1])
             y = self.pqmf.inverse(y)
             y = y.reshape(batch_size+(self.n_channels, -1))
+        elif self.output_mode=="complex_stft":
+            y = self.spectrogram.inverse(y)
 
         if self.resampler is not None:
             y = self.resampler.from_model_sampling_rate(y)
@@ -430,7 +449,7 @@ class VariationalScriptedRAVE(ScriptedRAVE):
         self.use_pca = use_pca
         super(VariationalScriptedRAVE, self).__init__(*args, **kwargs)
         if self.use_pca:
-            assert self.latent_size < self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
+            assert self.latent_size <= self.full_latent_size, "latent_size must be < %d"%(self.full_latent_size)
         self.register_method(
             "encode_full",
             in_channels=self.n_channels,
@@ -490,12 +509,16 @@ class VariationalScriptedRAVE(ScriptedRAVE):
             x = x.reshape(-1, 1, x.shape[-1])
             x = self.pqmf(x)
             x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode =="complex_stft":
+            x = self.spectrogram(x)
         elif self.input_mode == "mel":
             if self.spectrogram is not None:
                 x = self.spectrogram(x)[..., :-1]
                 x = torch.log1p(x).reshape(batch_size + (-1, x.shape[-1]))
             else:
                 raise RuntimeError()
+            
+        print(x.shape)
         z = self.encoder(x)
         z = self.post_process_latent_full(z)
         return z
@@ -519,6 +542,8 @@ class VariationalScriptedRAVE(ScriptedRAVE):
             x = x.reshape(-1, 1, x.shape[-1])
             x = self.pqmf(x)
             x = x.reshape(batch_size + (-1, x.shape[-1]))
+        elif self.input_mode =="complex_stft":
+            x = self.spectrogram(x)
         elif self.input_mode == "mel":
             if self.spectrogram is not None:
                 x = self.spectrogram(x)[..., :-1]
@@ -741,6 +766,28 @@ def main(argv):
         raise ValueError(f"Encoder type {type(pretrained.encoder)} "
                          "not supported for export.")
 
+    if isinstance(pretrained.spectrogram, CausalSTFT) and FLAGS.streaming:
+        pretrained.spectrogram.stream = True
+        
+    if isinstance(pretrained.spectrogram, StreamableSTFT) and FLAGS.streaming:
+        stft = pretrained.spectrogram
+        stft_kwargs = dict(
+            nfft=stft.nfft,
+            hop_size=stft.hop_size,
+            stream=True,
+            skip_features=stft.skip_features,
+            normalize=stft.normalize,
+            alpha_rescale=stft.alpha_rescale,
+            beta_rescale=stft.beta_rescale,
+        )
+        if FLAGS.use_causal_stft:
+            pretrained.spectrogram = CausalSTFT(**stft_kwargs)
+        else:
+            pretrained.spectrogram = StreamableSTFT(
+                **stft_kwargs,
+                log1p=stft.log1p,
+            )
+    
     logging.info("warmup pass")
 
 

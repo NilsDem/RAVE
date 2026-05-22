@@ -34,6 +34,12 @@ import gin
 import numpy as np
 from torch.nn.utils import weight_norm
 from torchaudio.transforms import Spectrogram
+import math
+from einops.layers.torch import Rearrange
+
+
+from .cachedConv2D import CachedConv2d, CachedConvTranspose2d
+
 
 from .core import amp_to_impulse_response, fft_convolve, mod_sigmoid
 amp_to_impulse_response = torch.fx.wrap(amp_to_impulse_response)
@@ -625,6 +631,206 @@ class EncoderV2(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.net(x)
         return x
+    
+    
+
+def _wn(module: nn.Module):
+    layer = torch.nn.utils.weight_norm(module)
+
+    def _prepare_scriptable(self):
+        for hook in self._forward_pre_hooks.values():
+            if (hook.__module__ == "torch.nn.utils.weight_norm"
+                    and hook.__class__.__name__ == "WeightNorm"):
+                torch.nn.utils.remove_weight_norm(self)
+        return self
+
+    layer.__prepare_scriptable__ = _prepare_scriptable.__get__(layer)
+    return layer
+
+def Conv2d(*args, **kwargs) -> nn.Module:
+    return CachedConv2d(*args, **kwargs, normalization=True)
+
+
+def ConvTranspose2d(*args, **kwargs) -> nn.Module:
+    return _wn(CachedConvTranspose2d(*args, **kwargs))
+
+
+def Conv1d(*args, **kwargs) -> nn.Module:
+    return _wn(cc.Conv1d(*args, **kwargs))
+
+
+class EncoderBlock2D(nn.Module):
+
+    def __init__(self,
+                 in_c: int,
+                 out_c: int,
+                 kernel_size=3,
+                 ratio: int =2,
+                 freq_ratio: int =2,
+                 kernel_multiplier: int =2,
+                 activation: Callable[[int], nn.Module] = lambda dim: nn.SiLU()):
+        super().__init__()
+        self.act = activation(in_c)
+        self.conv = Conv2d(in_c,
+                           in_c,
+                           kernel_size=kernel_size,
+                           padding_vert="same",
+                           padding_time=cc.get_padding(kernel_size=kernel_size,
+                                                       stride=1,
+                                                       mode="causal"))
+        self.pool = Conv2d(in_channels=in_c,
+                           out_channels=out_c,
+                           kernel_size=(freq_ratio * kernel_multiplier + 1,
+                                        ratio * kernel_multiplier + 1),
+                           stride=(freq_ratio, ratio),
+                           padding_vert="same",
+                           padding_time=cc.get_padding(
+                               kernel_size=ratio * kernel_multiplier + 1,
+                               mode="causal",
+                               stride=ratio))
+        self.proj_pool = nn.AvgPool2d(kernel_size=(freq_ratio, ratio),
+                                      stride=(freq_ratio, ratio))
+        self.proj = Conv2d(in_c, out_c, kernel_size=1, padding=0)
+
+    def forward(self, x):
+        res = x.clone()
+        x = self.act(x)
+        x = self.conv(x)
+        x = self.act(x)
+        x = self.pool(x)
+        res = self.proj_pool(res)
+        res = self.proj(res)
+        return x + res
+    
+
+
+class ConvBlock1d(nn.Module):
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 *,
+                 kernel_size: int = 3,
+                 stride: int = 1,
+                 dilation: int = 1,
+                 activation: Callable[[int], nn.Module] = lambda dim: nn.SiLU(),
+                 cumulative_delay=0):
+        super().__init__()
+        self.activation = activation(in_channels)
+        self.project = Conv1d(in_channels=in_channels,
+                              out_channels=out_channels,
+                              kernel_size=kernel_size,
+                              stride=stride,
+                              padding=cc.get_padding(kernel_size,
+                                                     dilation=dilation,
+                                                     mode="causal"),
+                              dilation=dilation,
+                              cumulative_delay=cumulative_delay)
+
+    def __prepare_scriptable__(self):
+        for hook in self.project._forward_pre_hooks.values():
+            if (hook.__module__ == "torch.nn.utils.weight_norm"
+                    and hook.__class__.__name__ == "WeightNorm"):
+                torch.nn.utils.remove_weight_norm(self.project)
+        return self
+
+    def forward(self, x):
+        x = self.activation(x)
+        x = self.project(x)
+        return x
+
+class Encoder2D(nn.Module):
+    def __init__(
+        self,
+        data_size: int,
+        n_freqs: int,
+        n_out: int,
+        capacity: int,
+        n_channels: int,
+        ratios_time: Sequence[int],
+        ratios_freq: Sequence[int],
+        ratios_channels: Sequence[int],
+        latent_size: int,
+        kernel_size: int,
+        recurrent_layer: Optional[Callable[[], nn.Module]] = None,
+        activation: Callable[[int], nn.Module] = lambda dim: nn.SiLU(),
+        adain: Optional[Callable[[int], nn.Module]] = None,
+    )-> None:
+        super().__init__()
+    
+
+        if adain is not None:
+            raise NotImplementedError("AdaIN not implemented for 2D generator yet")
+
+        # Stereo packing/unpacking
+        self.n_channels = n_channels
+        self.recurrent_layer = recurrent_layer
+        self.pack_input = Rearrange('b ch c f t -> (b ch) c f t',
+                                     ch=n_channels)
+        self.merge_stereo_features = Rearrange('(b ch) c f t -> b (ch c) f t',
+                                               ch=n_channels)
+
+        channels = [capacity * m for m in ratios_channels]
+        n = len(channels)
+        
+        self.preconv = Conv2d(data_size,
+                              channels[0],
+                              kernel_size=7,
+                              padding_vert=(7 - 1) // 2,
+                              padding_time=cc.get_padding(kernel_size=7,
+                                                          stride=1,
+                                                          mode="causal"))
+        
+        self.down_layers = nn.ModuleList()
+        for i in range(n - 1):
+            self.down_layers.append(
+                EncoderBlock2D(in_c=channels[i],
+                               out_c=channels[i + 1],
+                               kernel_size=kernel_size,
+                               ratio=ratios_time[i],
+                               freq_ratio=ratios_freq[i],
+                               activation=activation))
+
+        self.channels_merge = (EncoderBlock2D(in_c=n_channels * channels[-1],
+                                            out_c=channels[-1],
+                                            kernel_size=kernel_size,
+                                            ratio=1,
+                                            freq_ratio=1,
+                                            activation=activation)
+                             if n_channels > 1 else nn.Identity())
+        
+        freq_total_ratio = math.prod(ratios_freq)
+        self.freq_final_dim = (n_freqs//2) // freq_total_ratio
+        
+        self.middle_block_encode = ConvBlock1d(
+            in_channels=self.freq_final_dim * channels[-1],
+            out_channels=latent_size * n_out,
+            kernel_size=3,
+            activation=activation)
+        self.rearrange_encode = Rearrange('b c f t -> b (c f) t')
+        
+        self.reccurent_layer = recurrent_layer(latent_size * n_out) if recurrent_layer is not None else None
+    
+        
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pack_input(x)
+        x = x.squeeze(1)
+        x = self.preconv(x)
+        for layer in self.down_layers:
+            x = layer(x)
+        if self.n_channels > 1:
+            x = self.merge_stereo_features(x)
+            x = self.channels_merge(x)
+        x = self.rearrange_encode(x)
+        x = self.middle_block_encode(x)
+        if self.recurrent_layer is not None:
+            x = self.reccurent_layer(x)
+        return x
+        
+        
+
+
 
 
 class GeneratorV2(nn.Module):
@@ -747,6 +953,154 @@ class GeneratorV2(nn.Module):
 
     def set_warmed_up(self, state: bool):
         pass
+
+
+
+class DecoderBlock2D(nn.Module):
+
+    def __init__(self,
+                 in_c:int ,
+                 out_c:int ,
+                 kernel_size:int ,
+                 activation: Callable[[int], nn.Module] = lambda dim: nn.SiLU(),
+                 ratio:int =2,
+                 freq_ratio:int =2):
+        super().__init__()
+        self.act = activation(in_c)
+        self.up = ConvTranspose2d(
+            in_channels=in_c,
+            out_channels=out_c,
+            kernel_size=(2 * freq_ratio + (1 if freq_ratio == 1 else 0),
+                         2 * ratio + (1 if ratio == 1 else 0)),
+            stride=(freq_ratio, ratio),
+            padding=(freq_ratio // 2 + (1 if freq_ratio == 1 else 0),
+                     ratio // 2 + (1 if ratio == 1 else 0)))
+        self.conv = Conv2d(in_c,
+                           in_c,
+                           kernel_size=kernel_size,
+                           padding_vert="same",
+                           padding_time=cc.get_padding(kernel_size=kernel_size,
+                                                       stride=1,
+                                                       mode="causal"))
+        self.proj_pool = nn.Upsample(scale_factor=(freq_ratio, ratio),
+                                     mode='nearest')
+        self.proj = Conv2d(in_c, out_c, kernel_size=1, padding=0)
+        self.cumulative_delay = self.conv.cumulative_delay
+
+    def forward(self, x):
+        res = x.clone()
+        x = self.act(x)
+        x = self.conv(x)
+        x = self.act(x)
+        x = self.up(x)
+        res = self.proj_pool(res)
+        res = self.proj(res)
+        return x + res
+
+
+class Generator2D(nn.Module):
+    def __init__(
+        self,
+        data_size: int,
+        n_freqs: int,
+        capacity: int,
+        n_channels: int,
+        ratios_time: Sequence[int],
+        ratios_freq: Sequence[int],
+        ratios_channels: Sequence[int],
+        latent_size: int,
+        kernel_size: int,
+        recurrent_layer: Optional[Callable[[], nn.Module]] = None,
+        activation: Callable[[int], nn.Module] = lambda dim: nn.SiLU(),
+        adain: Optional[Callable[[int], nn.Module]] = None,
+    )-> None:
+        super().__init__()
+
+        if adain is not None:
+            raise NotImplementedError("AdaIN not implemented for 2D generator yet")
+        
+        if recurrent_layer is not None:
+            self.reccurent_layer = recurrent_layer(latent_size)
+        self.recurrent_layer = recurrent_layer
+        
+        self.n_channels = n_channels
+
+
+        channels = [2 * capacity * m for m in ratios_channels]
+        n = len(channels)
+        
+        self.outconv = Conv2d(channels[0],
+                              data_size,
+                              kernel_size=7,
+                              padding_vert=(7 - 1) // 2,
+                              padding_time=cc.get_padding(kernel_size=7,
+                                                          stride=1,
+                                                          mode="causal"))
+        
+        freq_total_ratio = math.prod(ratios_freq)
+        self.freq_final_dim = (n_freqs//2) // freq_total_ratio
+        
+        
+        self.rearrange_decode = Rearrange('b (c f) t -> b c f t',
+                                          f=self.freq_final_dim)
+        
+        self.middle_block_decode = ConvBlock1d(
+            in_channels=latent_size,
+            out_channels=self.freq_final_dim * channels[-1],
+            kernel_size=3)
+        
+        
+        self.up_layers = nn.ModuleList()
+
+        for i in range(1, n):
+            self.up_layers.append(
+                DecoderBlock2D(in_c=channels[n - i],
+                               out_c=channels[n - i - 1],
+                               kernel_size=kernel_size,
+                               ratio=ratios_time[n - i - 1],
+                               freq_ratio=ratios_freq[n - i - 1],
+                               activation=activation),)
+
+
+        # Multichannel unpacking
+        self.channel_split = (DecoderBlock2D(in_c=channels[-1],
+                                            out_c=n_channels * channels[-1],
+                                            kernel_size=kernel_size,
+                                            ratio=1,
+                                            freq_ratio=1,
+                                            activation=activation)
+                             if n_channels > 1 else nn.Identity())
+        
+        
+        self.unpack_input = Rearrange('(b ch) c f t -> b ch c f t',
+                                      ch=n_channels)
+        self.split_features = Rearrange('b (ch c) f t -> (b ch) c f t',
+                                               ch=n_channels)
+        
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.recurrent_layer is not None:
+            x = self.reccurent_layer(x)
+
+        x = self.middle_block_decode(x)
+
+        x = self.rearrange_decode(x)
+
+        if self.n_channels > 1:
+            x = self.channel_split(x)
+            x = self.split_features(x)
+
+        for layer in self.up_layers:
+            x = layer(x)
+        x = self.outconv(x)
+
+        x = self.unpack_input(x)
+        return x
+        
+    def set_warmed_up(self, state: bool):
+        pass
+        
+
 
 
 class VariationalEncoder(nn.Module):

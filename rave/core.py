@@ -23,6 +23,7 @@ from einops import rearrange
 from scipy.signal import lfilter
 from torch import hann_window
 import sys, multiprocessing
+import math
 
 
 def mod_sigmoid(x):
@@ -362,6 +363,96 @@ class AudioDistanceV1(nn.Module):
         return {'spectral_distance': distance}
 
 
+
+class STFTDistance(nn.Module):
+
+    def __init__(
+        self,
+        n_fft: int,
+        sampling_rate: int,
+        norm: Union[str, Sequence[str]] = None,
+        power: Union[int, None] = 1,
+        normalized: bool = True,
+        mel: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        if mel:
+            self.spec = torchaudio.transforms.MelSpectrogram(
+                sampling_rate,
+                n_fft,
+                hop_length=n_fft // 4,
+                n_mels=mel,
+                power=power,
+                normalized=normalized,
+                center=False,
+                pad_mode=None,
+            )
+        else:
+            self.spec = torchaudio.transforms.Spectrogram(
+                n_fft,
+                hop_length=n_fft // 4,
+                power=power,
+                normalized=normalized,
+                center=False,
+                pad_mode=None,
+            )
+
+        if isinstance(norm, str):
+            norm = (norm, )
+        self.norm = norm
+        self.n_fft = n_fft
+
+    def forward(self, x, y):
+        x = self.spec(x)
+        y = self.spec(y)
+
+        logx = torch.log1p(x)
+        logy = torch.log1p(y)
+
+        l_distance = mean_difference(x,
+                                     y,
+                                     norm='L1')
+        log_distance = mean_difference(logx,
+                                       logy,
+                                       norm='L2')
+        return l_distance + math.sqrt(self.n_fft / 2) * log_distance
+
+
+
+class AudioDistanceV4(nn.Module):
+
+    def __init__(self,
+                 scales: List[int],
+                 sr: int,
+                 mel_bands: Optional[List[int]],
+                 distance: nn.Module = STFTDistance) -> None:
+        super().__init__()
+
+        if mel_bands is None:
+            mel_bands = [None] * len(scales)
+
+        self.spectral_distances = nn.ModuleList([
+            distance(scale,
+                     sr,
+                     mel=mel)
+            for scale, mel in zip(scales, mel_bands)
+        ])
+        
+
+        self.name = "Spectral Distance"
+
+    def forward(self, x, y):
+        spectral_distance = 0.
+        for dist in self.spectral_distances:
+            spectral_distance = spectral_distance + dist(x, y)
+        return {'spectral_distance': spectral_distance}
+
+
+
+
+
+
+
 class WeightedInstantaneousSpectralDistance(nn.Module):
 
     def __init__(self,
@@ -554,10 +645,20 @@ class LoggerCallback(pl.Callback):
 
 
 class ModelCheckpoint(pl.callbacks.ModelCheckpoint):
-    def __init__(self, step_period: int = None, **kwargs):
+    def __init__(
+        self,
+        step_period: int = None,
+        last_filename: str = "last.ckpt",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.step_period = step_period 
+        self.last_filename = last_filename
         self.__counter = 0
+
+    def _save_last_checkpoint(self, trainer, monitor_candidates=None):
+        filename = os.path.join(self.dirpath, self.last_filename)
+        self._save_checkpoint(trainer, filename)
 
     def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.__counter += 1
@@ -565,6 +666,10 @@ class ModelCheckpoint(pl.callbacks.ModelCheckpoint):
             if self.__counter % self.step_period == 0:
                 filename = os.path.join(self.dirpath, f"epoch_{self.__counter}{self.FILE_EXTENSION}")
                 self._save_checkpoint(trainer, filename)
+                self._save_last_checkpoint(trainer)
+
+    def on_train_end(self, trainer, pl_module):
+        self._save_last_checkpoint(trainer)
 
 
 def get_valid_extensions():

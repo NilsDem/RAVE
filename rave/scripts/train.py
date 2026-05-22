@@ -225,6 +225,7 @@ def main(argv):
     accelerator, devices = rave.core.get_training_device(FLAGS.device, allow_multi=True)
     
     callbacks = [
+        rave.model.FirstCheckpointCallback(),
         validation_checkpoint,
         last_checkpoint,
         rave.model.WarmupCallback(),

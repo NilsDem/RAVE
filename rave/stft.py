@@ -464,7 +464,7 @@ class CausalSTFT(torch.nn.Module):
             ola_buffer[:, :, :-self.hop_size] = (
                 ola_buffer[:, :, self.hop_size:].clone())
             ola_buffer[:, :, -self.hop_size:] = 0
-            envelope_buffer[:, :, :-self.hop_size] = (
+            envelope_buffer[:, :, :-self.hop_size] = ( 
                 envelope_buffer[:, :, self.hop_size:].clone())
             envelope_buffer[:, :, -self.hop_size:] = 0
 

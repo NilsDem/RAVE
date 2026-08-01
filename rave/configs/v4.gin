@@ -113,5 +113,5 @@ rave.RAVE:
 
 rave.BetaWarmupCallback:
     initial_value = 1e-6 #1e-6
-    target_value = 5e-3 #5e-3
-    warmup_len = 10000
+    target_value = 1e-2 #5e-3
+    warmup_len = 20000

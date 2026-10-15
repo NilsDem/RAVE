@@ -64,7 +64,7 @@ def get_run_name(run_path):
         return None
     return ((version_path / "..").resolve()).stem
 
-def load_rave_checkpoint(model_path, n_channels=1, ema=False, name="last.ckpt", remove_keys=None, configs=[], overrides=[]):
+def load_rave_checkpoint(model_path, n_channels=1, ema=False, name="last.ckpt", remove_keys=None, configs=[], overrides=[], keep_config=False):
     model_path = Path(model_path)
     if not model_path.exists():
         raise FileNotFoundError(str(model_path))
@@ -98,6 +98,8 @@ def load_rave_checkpoint(model_path, n_channels=1, ema=False, name="last.ckpt", 
                 checkpoint["state_dict"],
                 strict=False,
             )
+    if keep_config:
+        gin.parse_config_files_and_bindings([config_file] + configs, overrides)
     return rave_model, run_path
 
 from rave.dataset import get_augmentations, parse_transform

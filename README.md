@@ -225,6 +225,50 @@ print(model.state_dict().keys())
 ```
 
 
+#### Fine-tuning modes
+
+Fine-tuning imports the source run's configuration and weights and starts at
+fine-tuning batch 0 with fresh optimizers. PCA updates are disabled by default.
+Use `--mode` to choose the objective:
+
+- `encoder` (default): update only the encoder using reconstruction and latent regularization
+  losses, keeping the decoder fixed.
+- `full`: update encoder and decoder using reconstruction, adversarial,
+  feature-matching and latent regularization losses; update the discriminator
+  on each batch.
+- `alternating`: on even batches (starting at 0), update decoder and discriminator
+  using reconstruction and adversarial losses; on odd batches, update only the
+  encoder using reconstruction and latent regularization. Feature matching is
+  excluded in this mode.
+
+The source configuration defines reconstruction losses, latent regularization
+(including the encoder's beta), and loss weights. `--regularization_weight`
+sets an additional regularization multiplier (default 1 in all modes). For variational models, `--beta 0.01` overrides the encoder beta
+imported from the source run; omitting it preserves the source value. Beta must
+be finite and nonnegative, and `--beta 0` disables KL regularization. Use `--regularization_weight 0` to explicitly disable latent regularization.
+The effective KL coefficient is encoder beta times the regularization multiplier
+and any configured regularization loss weight. Resume with the same beta.
+`--train` and `--freeze` further restrict parameter selection.
+Frozen modules run in evaluation mode; gradients can still pass through the
+fixed decoder to the encoder.
+
+```bash
+rave finetune --name adaptation --run /path/to/source/run --db_path /path/to/db \
+  --mode alternating --lr_encoder 1e-5 --lr_decoder 1e-4 \
+  --lr_discriminator 1e-4 --encoder_start_step 10000 --max_steps 50000
+```
+
+`--encoder_start_step` counts completed fine-tuning batches. Before this threshold,
+encoder parameters stay fixed; in alternating mode they start on the next encoder
+turn. The default is 0. `--max_steps` is the total target number of fine-tuning
+batches, including previously completed batches when resuming. Lightning's
+`global_step` may be higher because a batch can update two optimizers.
+
+Use `--ckpt /path/to/finetuning.ckpt` to resume optimizers, batch count and
+alternating phase. Supply the same mode, learning rates, encoder delay and
+regularization setting when resuming. Use `--run` alone to initialize from source
+weights. `--override` applies Gin bindings to the imported source configuration.
+
 #### Note: since v2.4, this argument defaults to True.
 
 ## Prior

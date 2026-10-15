@@ -1,4 +1,5 @@
 import hashlib
+import math
 import pdb
 import multiprocessing
 import os
@@ -66,10 +67,20 @@ flags.DEFINE_string('ckpt',
                     None,
                     help='Path to previous checkpoint of the run')
 flags.DEFINE_multi_string('override', default=[], help='Override gin binding')
+flags.DEFINE_enum('mode', 'encoder', ['encoder', 'full', 'alternating'],
+                  help='Fine-tuning objective and update schedule')
+flags.DEFINE_float('lr_encoder', 1.e-5, help='Encoder learning rate')
+flags.DEFINE_float('lr_decoder', 1.e-4, help='Decoder learning rate')
+flags.DEFINE_float('lr_discriminator', 1.e-4, help='Discriminator learning rate')
+flags.DEFINE_integer('encoder_start_step', 0, help='Fine-tuning batches before encoder updates')
+flags.DEFINE_float('beta', None, help='Override variational encoder beta (default: source value)')
+flags.DEFINE_float('regularization_weight', None,
+                   help='Override latent regularization weight (default: 1)')
+
 flags.DEFINE_integer('workers',
                      default=0,
                      help='Number of workers to spawn for dataset loading')
-flags.DEFINE_boolean('update_pca', default=None, help="Does the model updates its inner PCA (not recommanded for small transfer datasets)")
+flags.DEFINE_boolean('update_pca', default=False, help="Does the model updates its inner PCA (not recommanded for small transfer datasets)")
 flags.DEFINE_multi_string('device', default="auto", help="training device (default: auto. Can be cuda, cuda:0, ..., mps, etc.)")
 flags.DEFINE_bool('derivative',
                   default=False,
@@ -106,10 +117,26 @@ def parse_augmentations(augmentations, sr):
             gin.clear_config()
     return get_augmentations()
 
+class FinetuneCallback(pl.Callback):
+
+    def on_train_start(self, trainer, pl_module):
+        if pl_module.finetune_steps >= FLAGS.max_steps:
+            raise ValueError('max_steps must exceed the resumed fine-tuning step')
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if pl_module.finetune_steps >= FLAGS.max_steps:
+            trainer.should_stop = True
+
+
 def main(argv):
     torch.set_float32_matmul_precision('high')
     torch.manual_seed(FLAGS.seed)
     torch.backends.cudnn.benchmark = True
+
+    if FLAGS.beta is not None:
+        if not math.isfinite(FLAGS.beta) or FLAGS.beta < 0:
+            raise ValueError('beta must be finite and nonnegative')
+        FLAGS.override.append('blocks.VariationalEncoder.beta=%r'%FLAGS.beta)
 
     # parse configuration
     if FLAGS.reset_discriminator: 
@@ -118,9 +145,11 @@ def main(argv):
     else:
         remove_keys = None
     try:
-        model, run_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, remove_keys=remove_keys, configs=['finetune.gin'])
+        model, run_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, remove_keys=remove_keys, overrides=FLAGS.override, keep_config=True)
     except FileNotFoundError:
-        model, run_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, name=None, remove_keys=remove_keys, configs=['finetune.gin'])
+        model, run_path = rave.load_rave_checkpoint(FLAGS.run, ema=FLAGS.ema_weights, name=None, remove_keys=remove_keys, overrides=FLAGS.override, keep_config=True)
+    if FLAGS.beta is not None and not isinstance(model.encoder, rave.blocks.VariationalEncoder):
+        raise ValueError('--beta requires a variational encoder')
     RUN_NAME = rave.get_run_name(run_path)
 
     if FLAGS.derivative:
@@ -132,12 +161,29 @@ def main(argv):
     with gin.unlock_config():
         augmentations = parse_augmentations(map(add_gin_extension, FLAGS.augment), sr=model.sr)
         gin.bind_parameter('dataset.get_dataset.augmentations', augmentations)
-        gin.parse_config_file('finetune.gin')
+
+
+    if FLAGS.encoder_start_step < 0:
+        raise ValueError('encoder_start_step must be nonnegative')
+    if min(FLAGS.lr_encoder, FLAGS.lr_decoder, FLAGS.lr_discriminator) <= 0:
+        raise ValueError('Fine-tuning learning rates must be positive')
+    model.finetune_mode = FLAGS.mode
+    model.finetune_steps = 0
+    model.encoder_start_step = FLAGS.encoder_start_step
+    model.finetune_lrs = (FLAGS.lr_encoder, FLAGS.lr_decoder, FLAGS.lr_discriminator)
+    model.finetune_regularization = FLAGS.regularization_weight
+    model.no_freeze_when_warmed_up = True
+    model.encoder.no_freeze_when_warmed_up = True
+    model.warmed_up = True
+    model.encoder.set_warmed_up(model.warmed_up)
+    model.decoder.set_warmed_up(True)
 
     # parse keys to train / freeze 
     training_keys = rave.core.get_finetune_keys(model, FLAGS.train, FLAGS.freeze)
+    if FLAGS.mode == 'encoder':
+        training_keys = [k for k in training_keys if k.startswith('encoder.')]
     if len(training_keys) == 0:
-        logging.error('No training keys found with train=%s, freeze=%s'%(FLAGS.train, FLAGS.freeze))
+        raise ValueError('No training keys found with train=%s, freeze=%s'%(FLAGS.train, FLAGS.freeze))
     logging.info("Number of parameters fine-tuned : %d"%len(training_keys))
     gin.bind_parameter("rave.configure_optimizers.weight_list", training_keys)
 
@@ -158,7 +204,7 @@ def main(argv):
     if FLAGS.update_pca is None:
         FLAGS.update_pca = len(val) > rave.model.MAX_LATENT_FOR_VALIDATION
     elif FLAGS.update_pca: 
-        if len(val) < rave.core.model.MAX_LATENT_FOR_VALIDATION:
+        if len(val) < rave.model.MAX_LATENT_FOR_VALIDATION:
             logging.error(f'Cannot update PCA on {len(val)} examples. Set --update_pca empty, or explicitely pass --noupdate_pca')
             exit()
         logging.info("setting update_pca to %s"%FLAGS.update_pca)
@@ -195,12 +241,10 @@ def main(argv):
     accelerator, devices = rave.core.get_training_device(FLAGS.device, allow_multi=True)
     
     callbacks = [
+        FinetuneCallback(),
         rave.model.FirstCheckpointCallback(),
         validation_checkpoint,
         last_checkpoint,
-        rave.model.WarmupCallback(),
-        rave.model.QuantizeCallback(),
-        rave.model.BetaWarmupCallback(),
     ]
 
     run = None
@@ -221,7 +265,7 @@ def main(argv):
         devices=devices,
         callbacks=callbacks,
         max_epochs=300000,
-        max_steps=FLAGS.max_steps,
+        max_steps=-1,
         profiler="simple",
         enable_progress_bar=FLAGS.progress,
         log_every_n_steps=min(30, len(train)),

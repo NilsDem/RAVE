@@ -30,7 +30,7 @@ def main():
         app.run(train.main)
     elif command == 'finetune':
         from rave.scripts import finetune
-        sys.argv[0] = train.__name__
+        sys.argv[0] = finetune.__name__
         app.run(finetune.main)
     elif command == 'adapt':
         from rave.scripts import adapt

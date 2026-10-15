@@ -302,6 +302,31 @@ class RAVE(pl.LightningModule):
                     for name, param in dis_named_p),
             )
 
+        if getattr(self, 'finetune_mode', None) is not None:
+            selected = set(weight_list if weight_list is not None else dict(self.named_parameters()))
+            groups = []
+            dis_p = []
+            for prefix, module, lr in zip(
+                    ['encoder', 'decoder', 'discriminator'],
+                    [self.encoder, self.decoder, self.discriminator], self.finetune_lrs):
+                parameters = []
+                for name, parameter in module.named_parameters():
+                    parameter.requires_grad_(f'{prefix}.{name}' in selected)
+                    if parameter.requires_grad:
+                        parameters.append(parameter)
+                if parameters:
+                    if prefix == 'discriminator':
+                        dis_p = parameters
+                    else:
+                        groups.append({'params': parameters, 'lr': lr})
+            self.finetune_parameters = [p for p in self.parameters() if p.requires_grad]
+            if not groups:
+                raise ValueError('Fine-tuning requires encoder or decoder parameters')
+            optimizers = [torch.optim.Adam(groups, betas=(.5, .9))]
+            if dis_p:
+                optimizers.append(torch.optim.Adam(dis_p, self.finetune_lrs[2], (.5, .9)))
+            return optimizers
+
         if weight_list is None:
             gen_named_p = [(f"encoder.{name}", param)
                            for name, param in self.encoder.named_parameters()]
@@ -341,7 +366,7 @@ class RAVE(pl.LightningModule):
                 gen_opt = torch.optim.Adam(gen_p, 0., (.5, .9))
             optimizers.append({'optimizer': gen_opt, 'lr_scheduler': {'scheduler': torch.optim.lr_scheduler.LinearLR(gen_opt, start_factor=1.0, end_factor=0.1, total_iters=self.warmup)}})
             if len(dis_p) > 0:
-                dis_opt = torch.optim.Adam(gen_p, lr_dis, (.5, .9))
+                dis_opt = torch.optim.Adam(dis_p, lr_dis, (.5, .9))
             else:
                 dis_opt = torch.optim.Adam(gen_p, 0, (.5, .9))
                 self.update_discriminator_every = 1
@@ -477,9 +502,83 @@ class RAVE(pl.LightningModule):
             feature_fake.append(fake)
         return feature_real, feature_fake
 
+    def on_save_checkpoint(self, checkpoint):
+        if getattr(self, 'finetune_mode', None) is not None:
+            checkpoint['finetune'] = {
+                'steps': self.finetune_steps,
+                'mode': self.finetune_mode,
+                'encoder_start_step': self.encoder_start_step,
+                'lrs': self.finetune_lrs,
+                'regularization': self.finetune_regularization,
+                'beta': getattr(self.encoder, 'beta', None),
+            }
+
+    def on_load_checkpoint(self, checkpoint):
+        if getattr(self, 'finetune_mode', None) is not None:
+            state = checkpoint.get('finetune')
+            if state is None:
+                raise ValueError('Resume requires a fine-tuning checkpoint; use --run for source weights')
+            expected = (self.finetune_mode, self.encoder_start_step,
+                        tuple(self.finetune_lrs), self.finetune_regularization)
+            restored = (state['mode'], state['encoder_start_step'],
+                        tuple(state['lrs']), state['regularization'])
+            if expected != restored:
+                raise ValueError('Resume with the same fine-tuning mode, delay, learning rates and regularization')
+            if 'beta' in state and state['beta'] != getattr(self.encoder, 'beta', None):
+                raise ValueError('Resume with the same encoder beta')
+            self.finetune_steps = state['steps']
+
+    def _prepare_finetune_step(self):
+        encoder_turn = self.finetune_mode == 'encoder' or (
+            self.finetune_mode == 'alternating' and self.finetune_steps % 2 == 1)
+        encoder_active = self.finetune_steps >= self.encoder_start_step
+        adversarial = self.finetune_mode != 'encoder' and not encoder_turn
+        for prefix, module in [('encoder', self.encoder), ('decoder', self.decoder),
+                               ('discriminator', self.discriminator)]:
+            active = ((prefix == 'encoder' and encoder_active and (
+                encoder_turn or self.finetune_mode == 'full')) or
+                (prefix != 'encoder' and adversarial))
+            module.train(active)
+            for parameter in module.parameters():
+                parameter.requires_grad_(active and id(parameter) in self.finetune_parameter_ids)
+        return encoder_turn, adversarial
+
+    def _finetune_update(self, loss_gen, loss_dis, adversarial):
+        optimizers = self.optimizers()
+        if not isinstance(optimizers, (list, tuple)):
+            optimizers = [optimizers]
+        gen_opt = optimizers[0]
+        if adversarial and len(optimizers) > 1:
+            dis_opt = optimizers[1]
+            dis_opt.zero_grad()
+            for parameter in self.discriminator.parameters():
+                parameter.requires_grad_(id(parameter) in self.finetune_parameter_ids)
+            self.manual_backward(loss_dis)
+            if self.gradient_clip_dis is not None:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.gradient_clip_dis)
+        gen_opt.zero_grad()
+        loss = sum(value * (self.loss_weight(key, self.finetune_steps)
+                           if key in self.weights else 1.) for key, value in loss_gen.items())
+        if loss.requires_grad:
+            self.manual_backward(loss)
+            if self.gradient_clip_gen is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.encoder.parameters()) + list(self.decoder.parameters()), self.gradient_clip_gen)
+            gen_opt.step()
+        if adversarial and len(optimizers) > 1:
+            dis_opt.step()
+        self.log('finetune_steps', float(self.finetune_steps + 1))
+        self.finetune_steps += 1
+
     def training_step(self, batch, batch_idx):
         p = Profiler()
-        gen_opt, dis_opt = self.optimizers()
+        finetune = getattr(self, 'finetune_mode', None) is not None
+        if finetune:
+            self.finetune_parameter_ids = {id(p) for p in self.finetune_parameters}
+            encoder_turn, adversarial = self._prepare_finetune_step()
+        else:
+            gen_opt, dis_opt = self.optimizers()
+            adversarial = self.warmed_up
         x_raw = batch
         x_raw.requires_grad = True
 
@@ -544,8 +643,12 @@ class RAVE(pl.LightningModule):
 
         feature_matching_distance = 0.
 
-        if self.warmed_up:  # DISCRIMINATION
+        if adversarial:  # DISCRIMINATION
             xy = torch.cat([x_raw, y_raw], 0)
+            if finetune:
+                dis_features = self.discriminator(xy.detach())
+                for parameter in self.discriminator.parameters():
+                    parameter.requires_grad_(False)
             features = self.discriminator(xy)
 
             feature_real, feature_fake = self.split_features(features)
@@ -578,6 +681,10 @@ class RAVE(pl.LightningModule):
                 feature_real)
             loss_adv = loss_adv / len(feature_real)
             loss_dis = 2. * loss_dis / len(feature_real)
+            if finetune:
+                dis_real, dis_fake = self.split_features(dis_features)
+                loss_dis = 2. * sum(self.gan_loss(real[-1], fake[-1])[0]
+                                    for real, fake in zip(dis_real, dis_fake)) / len(dis_real)
 
         else:
             pred_real = torch.tensor(0.).to(x_raw)
@@ -592,14 +699,26 @@ class RAVE(pl.LightningModule):
         p.tick('update loss gen dict')
 
         if reg.item():
-            loss_gen['regularization'] = reg * self.beta_factor
+            regularization = self.beta_factor
+            if finetune:
+                regularization = self.finetune_regularization
+                if regularization is None:
+                    regularization = 1.
+                if self.finetune_mode == 'alternating' and not encoder_turn:
+                    regularization = 0.
+            loss_gen['regularization'] = reg * regularization
 
-        if self.warmed_up:
+        if adversarial:
             loss_gen['feature_matching'] = feature_matching_distance #REMOVE DOUBLE WEIGHTING * self.loss_weight('feature_matching', batch_idx) * 
             loss_gen['adversarial'] = loss_adv  #REMOVE DOUBLE WEIGHTING self.loss_weight('adversarial', batch_idx) * 
 
         # OPTIMIZATION
-        if not (batch_idx %
+        if finetune:
+            # Alternating decoder steps use reconstruction + adversarial only.
+            if self.finetune_mode == 'alternating':
+                loss_gen.pop('feature_matching', None)
+            self._finetune_update(loss_gen, loss_dis, adversarial)
+        elif not (batch_idx %
                 self.update_discriminator_every) and self.warmed_up:
             dis_opt.zero_grad()
             loss_dis.backward()

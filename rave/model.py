@@ -487,7 +487,9 @@ class RAVE(pl.LightningModule):
         return self.decode(z)
 
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
-        self.lr_schedulers().step()
+        scheduler = self.lr_schedulers()
+        if scheduler is not None:
+            scheduler.step()
         return super().on_train_batch_end(outputs, batch, batch_idx)
 
     def split_features(self, features):

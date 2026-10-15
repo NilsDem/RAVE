@@ -159,3 +159,25 @@ def test_beta_regularization_and_resume():
         resumed.on_load_checkpoint(checkpoint)
     resumed.encoder.beta = 0.25
     resumed.on_load_checkpoint(checkpoint)
+
+
+def test_batch_end_without_scheduler():
+    class Base:
+        def on_train_batch_end(self, outputs, batch, batch_idx):
+            self.batch_ended = True
+
+    hook = next(node for node in model.body
+                if isinstance(node, ast.FunctionDef) and node.name == 'on_train_batch_end')
+    cls = ast.ClassDef(name='HookModel', bases=[ast.Name(id='Base', ctx=ast.Load())],
+                       keywords=[], body=[hook], decorator_list=[])
+    scope = {'Base': Base}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
+                 'rave/model.py', 'exec'), scope)
+    instance = scope['HookModel']()
+    instance.lr_schedulers = lambda: None
+    instance.on_train_batch_end(None, None, 0)
+    assert instance.batch_ended
+    steps = []
+    instance.lr_schedulers = lambda: SimpleNamespace(step=lambda: steps.append(1))
+    instance.on_train_batch_end(None, None, 1)
+    assert steps == [1]

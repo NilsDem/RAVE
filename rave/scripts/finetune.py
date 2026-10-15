@@ -185,7 +185,8 @@ def main(argv):
     if len(training_keys) == 0:
         raise ValueError('No training keys found with train=%s, freeze=%s'%(FLAGS.train, FLAGS.freeze))
     logging.info("Number of parameters fine-tuned : %d"%len(training_keys))
-    gin.bind_parameter("rave.configure_optimizers.weight_list", training_keys)
+    with gin.unlock_config():
+        gin.bind_parameter("rave.configure_optimizers.weight_list", training_keys)
 
     # parse datasset
     dataset = rave.dataset.get_dataset(FLAGS.db_path,

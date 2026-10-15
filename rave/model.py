@@ -535,40 +535,50 @@ class RAVE(pl.LightningModule):
             self.finetune_mode == 'alternating' and self.finetune_steps % 2 == 1)
         encoder_active = self.finetune_steps >= self.encoder_start_step
         adversarial = self.finetune_mode != 'encoder' and not encoder_turn
+        self.finetune_discriminator_turn = (
+            self.finetune_mode == 'full' and
+            self.finetune_steps % self.update_discriminator_every == 0 and
+            any(id(p) in self.finetune_parameter_ids for p in self.discriminator.parameters()))
         for prefix, module in [('encoder', self.encoder), ('decoder', self.decoder),
                                ('discriminator', self.discriminator)]:
             active = ((prefix == 'encoder' and encoder_active and (
                 encoder_turn or self.finetune_mode == 'full')) or
                 (prefix != 'encoder' and adversarial))
+            if self.finetune_mode == 'full':
+                active = active and (self.finetune_discriminator_turn if prefix == 'discriminator'
+                                     else not self.finetune_discriminator_turn)
             module.train(active)
             for parameter in module.parameters():
                 parameter.requires_grad_(active and id(parameter) in self.finetune_parameter_ids)
         return encoder_turn, adversarial
+
+    def _finetune_discriminator_backward(self, loss_dis):
+        dis_opt = self.optimizers()[1]
+        dis_opt.zero_grad()
+        self.manual_backward(loss_dis)
+        if self.gradient_clip_dis is not None:
+            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.gradient_clip_dis)
 
     def _finetune_update(self, loss_gen, loss_dis, adversarial):
         optimizers = self.optimizers()
         if not isinstance(optimizers, (list, tuple)):
             optimizers = [optimizers]
         gen_opt = optimizers[0]
-        if adversarial and len(optimizers) > 1:
-            dis_opt = optimizers[1]
-            dis_opt.zero_grad()
-            for parameter in self.discriminator.parameters():
-                parameter.requires_grad_(id(parameter) in self.finetune_parameter_ids)
-            self.manual_backward(loss_dis)
-            if self.gradient_clip_dis is not None:
-                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.gradient_clip_dis)
-        gen_opt.zero_grad()
-        loss = sum(value * (self.loss_weight(key, self.finetune_steps)
-                           if key in self.weights else 1.) for key, value in loss_gen.items())
-        if loss.requires_grad:
-            self.manual_backward(loss)
-            if self.gradient_clip_gen is not None:
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.encoder.parameters()) + list(self.decoder.parameters()), self.gradient_clip_gen)
-            gen_opt.step()
-        if adversarial and len(optimizers) > 1:
-            dis_opt.step()
+        if self.finetune_discriminator_turn:
+            self._finetune_discriminator_backward(loss_dis)
+            optimizers[1].step()
+        else:
+            gen_opt.zero_grad()
+            loss = sum(value * (self.loss_weight(key, self.finetune_steps)
+                               if key in self.weights else 1.) for key, value in loss_gen.items())
+            if loss.requires_grad:
+                self.manual_backward(loss)
+                if self.gradient_clip_gen is not None:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.encoder.parameters()) + list(self.decoder.parameters()), self.gradient_clip_gen)
+                gen_opt.step()
+            if adversarial and self.finetune_mode == 'alternating' and len(optimizers) > 1:
+                optimizers[1].step()
         self.log('finetune_steps', float(self.finetune_steps + 1))
         self.finetune_steps += 1
 
@@ -582,7 +592,7 @@ class RAVE(pl.LightningModule):
             gen_opt, dis_opt = self.optimizers()
             adversarial = self.warmed_up
         x_raw = batch
-        x_raw.requires_grad = True
+        x_raw.requires_grad = not (finetune and self.finetune_discriminator_turn)
 
         batch_size = x_raw.shape[:-2]
         self.encoder.set_warmed_up(self.warmed_up)
@@ -647,11 +657,22 @@ class RAVE(pl.LightningModule):
 
         if adversarial:  # DISCRIMINATION
             xy = torch.cat([x_raw, y_raw], 0)
-            if finetune:
-                dis_features = self.discriminator(xy.detach())
+            if finetune and self.finetune_mode == 'alternating':
+                dis_optimizers = self.optimizers()
+                if isinstance(dis_optimizers, (list, tuple)) and len(dis_optimizers) > 1:
+                    dis_features = self.discriminator(xy.detach())
+                    dis_real, dis_fake = self.split_features(dis_features)
+                    dis_loss = 2. * sum(self.gan_loss(real[-1], fake[-1])[0]
+                                       for real, fake in zip(dis_real, dis_fake)) / len(dis_real)
+                    self._finetune_discriminator_backward(dis_loss)
+                    dis_loss = dis_loss.detach()
+                    del dis_features, dis_real, dis_fake
+                else:
+                    dis_loss = xy.new_zeros(())
                 for parameter in self.discriminator.parameters():
                     parameter.requires_grad_(False)
-            features = self.discriminator(xy)
+            features = self.discriminator(
+                xy.detach() if finetune and self.finetune_discriminator_turn else xy)
 
             feature_real, feature_fake = self.split_features(features)
 
@@ -683,10 +704,8 @@ class RAVE(pl.LightningModule):
                 feature_real)
             loss_adv = loss_adv / len(feature_real)
             loss_dis = 2. * loss_dis / len(feature_real)
-            if finetune:
-                dis_real, dis_fake = self.split_features(dis_features)
-                loss_dis = 2. * sum(self.gan_loss(real[-1], fake[-1])[0]
-                                    for real, fake in zip(dis_real, dis_fake)) / len(dis_real)
+            if finetune and self.finetune_mode == 'alternating':
+                loss_dis = dis_loss
 
         else:
             pred_real = torch.tensor(0.).to(x_raw)

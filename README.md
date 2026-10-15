@@ -235,7 +235,10 @@ Use `--mode` to choose the objective:
   losses, keeping the decoder fixed.
 - `full`: update encoder and decoder using reconstruction, adversarial,
   feature-matching and latent regularization losses; update the discriminator
-  on each batch.
+  using the source run's `update_discriminator_every` cadence. Discriminator
+  batches update only the discriminator; other batches update encoder/decoder.
+  The cadence uses completed fine-tuning batches, so it persists across epochs
+  and checkpoint resume.
 - `alternating`: on even batches (starting at 0), update decoder and discriminator
   using reconstruction and adversarial losses; on odd batches, update only the
   encoder using reconstruction and latent regularization. Feature matching is

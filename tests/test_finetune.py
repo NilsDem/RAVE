@@ -12,7 +12,8 @@ from torch import nn
 source = ast.parse((Path(__file__).parents[1] / 'rave/model.py').read_text())
 model = next(node for node in source.body if isinstance(node, ast.ClassDef) and node.name == 'RAVE')
 names = {'configure_optimizers', '_prepare_finetune_step', '_finetune_update',
-         'training_step', 'on_save_checkpoint', 'on_load_checkpoint'}
+         'training_step', 'on_save_checkpoint', 'on_load_checkpoint',
+         '_finetune_discriminator_backward'}
 methods = [node for node in model.body if isinstance(node, ast.FunctionDef) and node.name in names]
 for method in methods:
     method.decorator_list = []
@@ -37,8 +38,12 @@ class Decoder(Encoder):
 
 
 class Discriminator(nn.Linear):
+    calls = 0
+
     def forward(self, x):
-        return [[super().forward(x)]]
+        self.calls += 1
+        output = super().forward(x)
+        return [[output.tanh(), output]]
 
 
 class Toy(nn.Module):
@@ -52,6 +57,7 @@ class Toy(nn.Module):
         self.encoder_start_step = delay
         self.finetune_lrs = (1e-3, 1e-2, 1e-2)
         self.finetune_regularization = None
+        self.update_discriminator_every = 4
         self.warmed_up = True
         self.output_mode = 'raw'
         self.pqmf = None
@@ -125,8 +131,22 @@ def test_encoder_reconstruction_and_regularization():
 def test_full_delay_and_learning_rates():
     model = Toy('full', delay=1)
     assert [group['lr'] for group in model.opts[0].param_groups] == [1e-3, 1e-2]
-    assert step(model) == {'decoder', 'discriminator'}
-    assert step(model) == {'encoder', 'decoder', 'discriminator'}
+    assert step(model) == {'discriminator'}
+    assert model.discriminator.calls == 1
+    assert step(model) == {'encoder', 'decoder'}
+    assert model.discriminator.calls == 2
+    assert step(model) == {'encoder', 'decoder'}
+    assert step(model) == {'encoder', 'decoder'}
+    assert step(model) == {'discriminator'}
+    assert model.discriminator.calls == 5
+
+
+def test_full_encoder_stays_frozen_during_delay():
+    model = Toy('full', delay=3)
+    assert step(model) == {'discriminator'}
+    assert step(model) == {'decoder'}
+    assert step(model) == {'decoder'}
+    assert step(model) == {'encoder', 'decoder'}
 
 
 def test_alternating_and_resume():
@@ -181,3 +201,22 @@ def test_batch_end_without_scheduler():
     instance.lr_schedulers = lambda: SimpleNamespace(step=lambda: steps.append(1))
     instance.on_train_batch_end(None, None, 1)
     assert steps == [1]
+
+
+def test_alternating_discriminator_backward_precedes_generator_forward():
+    model = Toy('alternating')
+    events = []
+    model.discriminator.register_forward_hook(lambda *args: events.append('forward'))
+    model.discriminator.weight.register_hook(lambda grad: events.append('backward'))
+    assert step(model) == {'decoder', 'discriminator'}
+    assert events == ['forward', 'backward', 'forward']
+
+
+def test_full_resume_preserves_discriminator_cadence():
+    model = Toy('full')
+    assert step(model) == {'discriminator'}
+    checkpoint = {}
+    model.on_save_checkpoint(checkpoint)
+    resumed = Toy('full')
+    resumed.on_load_checkpoint(checkpoint)
+    assert step(resumed) == {'encoder', 'decoder'}

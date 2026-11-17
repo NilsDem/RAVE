@@ -311,3 +311,16 @@ def test_full_asymetric_reconstruction_trains_encoder_and_respects_delay():
     assert restored.finetune_steps == 3
     assert step(restored) == {'encoder', 'decoder'}
     assert step(restored) == {'discriminator'}
+
+
+def test_asymmetric_reconstruction_backward_precedes_second_decoder_pass():
+    model = Toy('full_asymetric')
+    model.finetune_steps = 1
+    events = []
+    model.decoder.register_forward_hook(lambda *args: events.append('decode'))
+    def backward(loss):
+        events.append('backward')
+        loss.backward()
+    model.manual_backward = backward
+    assert step(model) == {'encoder', 'decoder'}
+    assert events == ['decode', 'backward', 'decode', 'backward']

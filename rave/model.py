@@ -606,9 +606,13 @@ class RAVE(pl.LightningModule):
             self._finetune_discriminator_backward(loss_dis)
             optimizers[1].step()
         else:
-            gen_opt.zero_grad()
+            asymmetric = self.finetune_mode == 'full_asymetric'
+            if not asymmetric:
+                gen_opt.zero_grad()
+            terms = ((key, value) for key, value in loss_gen.items()
+                     if not asymmetric or key in ('adversarial', 'feature_matching'))
             loss = sum(value * (self.loss_weight(key, self.finetune_steps)
-                               if key in self.weights else 1.) for key, value in loss_gen.items())
+                               if key in self.weights else 1.) for key, value in terms)
             if loss.requires_grad:
                 self.manual_backward(loss)
                 if self.gradient_clip_gen is not None:
@@ -695,6 +699,25 @@ class RAVE(pl.LightningModule):
 
         for k, v in fullband_distance.items():
             distances[f'fullband_{k}'] = self.loss_weight('audio_distance', batch_idx) *  v
+
+        asymmetric_generator = (finetune and self.finetune_mode == 'full_asymetric'
+                                and not self.finetune_discriminator_turn)
+        if asymmetric_generator:
+            # Accumulate reconstruction/KL gradients before building the second
+            # decoder graph, freeing the first graph's saved activations.
+            optimizers = self.optimizers()
+            gen_opt = optimizers[0] if isinstance(optimizers, (list, tuple)) else optimizers
+            gen_opt.zero_grad()
+            reconstruction = sum(value * (self.loss_weight(key, self.finetune_steps)
+                                          if key in self.weights else 1.)
+                                 for key, value in distances.items())
+            if reg.item():
+                reconstruction = reconstruction + reg * (self.loss_weight('regularization', self.finetune_steps)
+                                                           if 'regularization' in self.weights else 1.)
+            if torch.is_tensor(reconstruction) and reconstruction.requires_grad:
+                self.manual_backward(reconstruction)
+            distances = {key: value.detach() for key, value in distances.items()}
+            reg = reg.detach()
 
         feature_matching_distance = 0.
 

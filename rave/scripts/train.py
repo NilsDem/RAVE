@@ -259,6 +259,7 @@ def main(argv):
     last_checkpoint = rave.core.ModelCheckpoint(filename=last_filename, step_period=FLAGS.save_every)
 
     val_check = {
+        "limit_val_batches": 100,
         "val_check_interval": 1 if FLAGS.smoke_test else FLAGS.val_every,
         "check_val_every_n_epoch": None,
     }
@@ -304,7 +305,6 @@ def main(argv):
         max_steps=FLAGS.max_steps,
         profiler="simple",
         # limit_train_batches=1,
-        # limit_val_batches=30,
         # fast_dev_run=True,
         enable_progress_bar=FLAGS.progress,
         log_every_n_steps=min(30, len(train)),

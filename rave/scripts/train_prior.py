@@ -124,7 +124,7 @@ def main(argv):
     last_filename = "last" if FLAGS.save_every is None else "epoch-{epoch:04d}"                                                        
     last_checkpoint = rave.core.ModelCheckpoint(filename=last_filename, step_period=FLAGS.save_every)
 
-    val_check = {}
+    val_check = {"limit_val_batches": 100}
     if len(train) >= FLAGS.val_every:
         val_check["val_check_interval"] = 1 if FLAGS.smoke_test else FLAGS.val_every
     else:

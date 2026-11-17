@@ -279,3 +279,35 @@ def test_validation_updates_pca_from_small_dataset():
     assert instance.fidelity[-1] == pytest.approx(1.)
     assert not torch.equal(instance.latent_pca, torch.eye(3))
     assert not instance.latent_val_buffer
+
+
+def test_full_asymetric_routes_adversarial_gradients_only_to_decoder():
+    model = Toy('full_asymetric')
+    model.encoder.beta = 0.
+    model.weights = {'fullband_mse': 0., 'adversarial': 1., 'feature_matching': 1.}
+    model.loss_weight = lambda key, step: model.weights.get(key, 1.)
+    calls = []
+    model.decoder.register_forward_hook(lambda *args: calls.append(1))
+    assert step(model) == {'discriminator'}
+    assert len(calls) == 1
+    assert step(model) == {'decoder'}
+    assert len(calls) == 3
+    assert 'adversarial' in model.losses and 'feature_matching' in model.losses
+
+
+def test_full_asymetric_reconstruction_trains_encoder_and_respects_delay():
+    model = Toy('full_asymetric', delay=2)
+    model.encoder.beta = 0.
+    model.weights = {'fullband_mse': 1., 'adversarial': 0., 'feature_matching': 0.}
+    model.loss_weight = lambda key, step: model.weights.get(key, 1.)
+    assert step(model) == {'discriminator'}
+    assert step(model) == {'decoder'}
+    assert step(model) == {'encoder', 'decoder'}
+    checkpoint = {}
+    model.on_save_checkpoint(checkpoint)
+    restored = Toy('full_asymetric', delay=2)
+    restored.encoder.beta = 0.
+    restored.on_load_checkpoint(checkpoint)
+    assert restored.finetune_steps == 3
+    assert step(restored) == {'encoder', 'decoder'}
+    assert step(restored) == {'discriminator'}

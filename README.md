@@ -239,6 +239,7 @@ Use `--mode` to choose the objective:
   batches update only the discriminator; other batches update encoder/decoder.
   The cadence uses completed fine-tuning batches, so it persists across epochs
   and checkpoint resume.
+- `full_asymetric`: encoder receives reconstruction and latent regularization; decoder receives reconstruction, adversarial and feature-matching losses. Discriminator updates follow the `full` cadence. Generator steps decode twice.
 - `alternating`: on even batches (starting at 0), update decoder and discriminator
   using reconstruction and adversarial losses; on odd batches, update only the
   encoder using reconstruction and latent regularization. Feature matching is

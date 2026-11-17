@@ -574,15 +574,15 @@ class RAVE(pl.LightningModule):
         # try with adversarial loss in encoder mode
         # adversarial = (not encoder_turn) or self.finetune_mode == "encoder"
         self.finetune_discriminator_turn = (
-            self.finetune_mode in ('full', 'decoder') and
+            self.finetune_mode in ('full', 'decoder', 'full_asymetric') and
             self.finetune_steps % self.update_discriminator_every == 0 and
             any(id(p) in self.finetune_parameter_ids for p in self.discriminator.parameters()))
         for prefix, module in [('encoder', self.encoder), ('decoder', self.decoder),
                                ('discriminator', self.discriminator)]:
             active = ((prefix == 'encoder' and encoder_active and (
-                encoder_turn or self.finetune_mode == 'full')) or
+                encoder_turn or self.finetune_mode in ('full', 'full_asymetric'))) or
                 (prefix != 'encoder' and adversarial))
-            if self.finetune_mode in ('full', 'decoder'):
+            if self.finetune_mode in ('full', 'decoder', 'full_asymetric'):
                 active = active and (self.finetune_discriminator_turn if prefix == 'discriminator'
                                      else not self.finetune_discriminator_turn)
             module.train(active)
@@ -699,8 +699,19 @@ class RAVE(pl.LightningModule):
         feature_matching_distance = 0.
 
         if adversarial:  # DISCRIMINATION
+            if finetune and self.finetune_mode == 'full_asymetric' and not self.finetune_discriminator_turn:
+                # Adversarial and feature-matching gradients train the decoder,
+                # but must not propagate into the encoder.
+                y_adversarial = self.decoder(z.detach())
+                if self.output_mode == 'pqmf':
+                    y_adversarial = _pqmf_decode(self.pqmf, y_adversarial, batch_size=batch_size, n_channels=self.n_channels)
+                elif self.output_mode == 'complex_stft':
+                    y_adversarial = self.spectrogram.inverse(y_adversarial)
+                y_adversarial = y_adversarial[..., :x_raw.shape[-1]]
+            else:
+                y_adversarial = y_raw
             if finetune or discriminator_turn:
-                xy = torch.cat([x_raw, y_raw], 0)
+                xy = torch.cat([x_raw, y_adversarial], 0)
             if finetune and self.finetune_mode == 'alternating':
                 dis_optimizers = self.optimizers()
                 if isinstance(dis_optimizers, (list, tuple)) and len(dis_optimizers) > 1:

@@ -161,7 +161,7 @@ rave finetune --name voice_ft --run runs/flute_abc123 --db_path /data/voice --mo
 | `--run`                   | required   | Source run (folder or `.ckpt`). Its configuration is reused. |
 | `--db_path`               | required   | Preprocessed dataset. |
 | `--out_path`              | `runs/`    | Output folder. |
-| `--mode`                  | `encoder`  | Objective, see below: `encoder`, `decoder`, `full`, `alternating`. |
+| `--mode`                  | `encoder`  | Objective, see below: `encoder`, `decoder`, `full`, `full_asymetric`, `alternating`. |
 | `--train`                 | `all`      | (multi) Weights to train: `all`, `encoder`, `decoder`, `discriminator`, or a regular expression on weight names. Intersected with `--mode`. |
 | `--freeze`                | —          | (multi) Weights to freeze (same syntax), removed from the `--train` selection. |
 | `--lr_encoder`            | `1e-5`     | Encoder learning rate. |

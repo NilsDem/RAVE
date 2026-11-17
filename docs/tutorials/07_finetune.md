@@ -56,6 +56,7 @@ the **discriminator** (judges whether audio sounds real; only used for training)
 | `encoder` *(default)* | encoder | reconstruction + latent regularization | decoder, discriminator |
 | `decoder` | decoder | reconstruction + adversarial + feature matching | encoder, discriminator |
 | `full` | encoder, decoder, and discriminator every few steps | reconstruction + adversarial + feature matching + regularization | — |
+| `full_asymetric` | encoder + decoder, alternating with discriminator updates | encoder: reconstruction + regularization; decoder: reconstruction + adversarial + feature matching | two decoder passes on generator steps |
 | `alternating` | even steps: decoder + discriminator; odd steps: encoder | even: reconstruction + adversarial; odd: reconstruction + regularization | — |
 
 ### `encoder` — a new input, the same sound
